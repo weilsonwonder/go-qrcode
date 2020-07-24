@@ -42,7 +42,8 @@ func TestExampleEncodeWithColourAndWithoutBorder(t *testing.T) {
 	q.DisableBorder = true
 
 	// Optionally, set the colours.
-	q.ForegroundColor = color.RGBA{R: 0x33, G: 0x33, B: 0x66, A: 0xff}
+	q.PixelColor = color.RGBA{R: 0x33, G: 0x33, B: 0x66, A: 0xff}
+	q.BoxColor = color.RGBA{R: 0x33, G: 0x33, B: 0x66, A: 0xff}
 	q.BackgroundColor = color.RGBA{R: 0xef, G: 0xef, B: 0xef, A: 0xff}
 
 	err = q.WriteFile(256, "example2.png")

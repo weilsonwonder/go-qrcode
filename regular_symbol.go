@@ -4,6 +4,8 @@
 package qrcode
 
 import (
+	"image"
+
 	bitset "github.com/skip2/go-qrcode/bitset"
 )
 
@@ -155,6 +157,27 @@ func (m *regularSymbol) addFinderPatterns() {
 	m.symbol.set2dPattern(0, m.size-fpSize, fp)
 	m.symbol.set2dPattern(0, m.size-fpSize-1, fpHBorder)
 	m.symbol.set2dPattern(fpSize, m.size-fpSize-1, fpVBorder)
+
+	/* set again for finder only pattern */
+	m.symbol.finderPatternSize = fpSize
+	m.symbol.finderPatternTLPoint = image.Point{0, 0}
+	m.symbol.finderPatternTRPoint = image.Point{m.size - fpSize, 0}
+	m.symbol.finderPatternBLPoint = image.Point{0, m.size - fpSize}
+
+	// Top left Finder Pattern.
+	m.symbol.set2dPatternForFinder(0, 0, fp)
+	m.symbol.set2dPatternForFinder(0, fpSize, fpHBorder)
+	m.symbol.set2dPatternForFinder(fpSize, 0, fpVBorder)
+
+	// Top right Finder Pattern.
+	m.symbol.set2dPatternForFinder(m.size-fpSize, 0, fp)
+	m.symbol.set2dPatternForFinder(m.size-fpSize-1, fpSize, fpHBorder)
+	m.symbol.set2dPatternForFinder(m.size-fpSize-1, 0, fpVBorder)
+
+	// Bottom left Finder Pattern.
+	m.symbol.set2dPatternForFinder(0, m.size-fpSize, fp)
+	m.symbol.set2dPatternForFinder(0, m.size-fpSize-1, fpHBorder)
+	m.symbol.set2dPatternForFinder(fpSize, m.size-fpSize-1, fpVBorder)
 }
 
 func (m *regularSymbol) addAlignmentPatterns() {
@@ -167,6 +190,12 @@ func (m *regularSymbol) addAlignmentPatterns() {
 			m.symbol.set2dPattern(x-2, y-2, alignmentPattern)
 		}
 	}
+
+	cent := alignmentPatternCenter[m.version.version]
+	x, y := cent[len(cent)-1], cent[len(cent)-1]
+	m.symbol.set2dPatternForLastAlignment(x-2, y-2, alignmentPattern)
+	m.symbol.alignmentPatternSize = len(alignmentPattern) // 5
+	m.symbol.alignmentPatternPoint = image.Point{x - 2, y - 2}
 }
 
 func (m *regularSymbol) addTimingPatterns() {

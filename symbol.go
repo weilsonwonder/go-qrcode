@@ -3,6 +3,10 @@
 
 package qrcode
 
+import (
+	"image"
+)
+
 // symbol is a 2D array of bits representing a QR Code symbol.
 //
 // A symbol consists of size*size modules, with each module normally drawn as a
@@ -22,6 +26,9 @@ package qrcode
 // border) is returned by bitmap().
 //
 type symbol struct {
+	finderPatternModule    [][]bool
+	alignmentPatternModule [][]bool
+
 	// Value of module at [y][x]. True is set.
 	module [][]bool
 
@@ -33,6 +40,14 @@ type symbol struct {
 	//
 	// size = symbolSize + 2*quietZoneSize.
 	size int
+
+	// Width/height of a single finder pattern only.
+	finderPatternTLPoint, finderPatternTRPoint, finderPatternBLPoint image.Point
+	finderPatternSize                                                int
+
+	// Width/height of the last bottom right alignment pattern only.
+	alignmentPatternPoint image.Point
+	alignmentPatternSize  int
 
 	// Width/height of the symbol only.
 	symbolSize int
@@ -46,10 +61,14 @@ type symbol struct {
 func newSymbol(size int, quietZoneSize int) *symbol {
 	var m symbol
 
+	m.finderPatternModule = make([][]bool, size+2*quietZoneSize)
+	m.alignmentPatternModule = make([][]bool, size+2*quietZoneSize)
 	m.module = make([][]bool, size+2*quietZoneSize)
 	m.isUsed = make([][]bool, size+2*quietZoneSize)
 
 	for i := range m.module {
+		m.finderPatternModule[i] = make([]bool, size+2*quietZoneSize)
+		m.alignmentPatternModule[i] = make([]bool, size+2*quietZoneSize)
 		m.module[i] = make([]bool, size+2*quietZoneSize)
 		m.isUsed[i] = make([]bool, size+2*quietZoneSize)
 	}
@@ -114,6 +133,56 @@ func (m *symbol) bitmap() [][]bool {
 	}
 
 	return module
+}
+
+// set2dPattern sets a 2D array of modules, starting at (x, y).
+func (m *symbol) set2dPatternForFinder(x int, y int, v [][]bool) {
+	for j, row := range v {
+		for i, value := range row {
+			m.finderPatternModule[y+j+m.quietZoneSize][x+i+m.quietZoneSize] = value
+		}
+	}
+}
+
+// finderPatternBitmap returns only toggles for the finder patterns, sized the same as bitmap().
+func (m *symbol) finderPatternBitmap() [][]bool {
+	module := make([][]bool, len(m.finderPatternModule))
+
+	for i := range m.finderPatternModule {
+		module[i] = m.finderPatternModule[i][:]
+	}
+
+	return module
+}
+
+// set2dPatternForLastAlignment sets a 2D array of modules, starting at (x, y).
+func (m *symbol) set2dPatternForLastAlignment(x int, y int, v [][]bool) {
+	for j, row := range v {
+		for i, value := range row {
+			m.alignmentPatternModule[y+j+m.quietZoneSize][x+i+m.quietZoneSize] = value
+		}
+	}
+}
+
+// lastAlignmentPatternBitmap returns only toggles for the finder patterns, sized the same as bitmap().
+func (m *symbol) lastAlignmentPatternBitmap() [][]bool {
+	module := make([][]bool, len(m.alignmentPatternModule))
+
+	for i := range m.alignmentPatternModule {
+		module[i] = m.alignmentPatternModule[i][:]
+	}
+
+	return module
+}
+
+func (m *symbol) finderPatternPoints() (image.Point, image.Point, image.Point) {
+	return image.Point{m.finderPatternTLPoint.X, m.finderPatternTLPoint.Y},
+		image.Point{m.finderPatternTRPoint.X, m.finderPatternTRPoint.Y},
+		image.Point{m.finderPatternBLPoint.X, m.finderPatternBLPoint.Y}
+}
+
+func (m *symbol) borderSize() int {
+	return m.quietZoneSize
 }
 
 // string returns a pictorial representation of the symbol, suitable for

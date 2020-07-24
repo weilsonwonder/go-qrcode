@@ -54,14 +54,18 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"os"
 
+	"github.com/disintegration/imaging"
+
 	bitset "github.com/skip2/go-qrcode/bitset"
-	reedsolomon "github.com/skip2/go-qrcode/reedsolomon"
+	"github.com/skip2/go-qrcode/reedsolomon"
 )
 
 // Encode a QR Code and return a raw PNG image.
@@ -114,7 +118,8 @@ func WriteColorFile(content string, level RecoveryLevel, size int, background,
 	q, err := New(content, level)
 
 	q.BackgroundColor = background
-	q.ForegroundColor = foreground
+	q.BoxColor = foreground
+	q.PixelColor = foreground
 
 	if err != nil {
 		return err
@@ -133,8 +138,13 @@ type QRCode struct {
 	VersionNumber int
 
 	// User settable drawing options.
-	ForegroundColor color.Color
-	BackgroundColor color.Color
+	centerLogoBackgroundOffset int
+	CenterLogo                 *image.Image
+	FinderPatternImage         *image.Image
+	AlignmentPatternImage      *image.Image
+	BackgroundColor            color.Color
+	BoxColor                   color.Color
+	PixelColor                 color.Color
 
 	// Disable the QR Code border.
 	DisableBorder bool
@@ -145,6 +155,11 @@ type QRCode struct {
 	data   *bitset.Bitset
 	symbol *symbol
 	mask   int
+
+	// cache for logo sizing
+	centerLogoCache            map[int]image.Image
+	finderPatternImageCache    map[int]image.Image
+	alignmentPatternImageCache map[int]image.Image
 }
 
 // New constructs a QRCode.
@@ -189,8 +204,9 @@ func New(content string, level RecoveryLevel) (*QRCode, error) {
 		Level:         level,
 		VersionNumber: chosenVersion.version,
 
-		ForegroundColor: color.Black,
 		BackgroundColor: color.White,
+		PixelColor:      color.Black,
+		BoxColor:        color.Black,
 
 		encoder: encoder,
 		data:    encoded,
@@ -246,8 +262,9 @@ func NewWithForcedVersion(content string, version int, level RecoveryLevel) (*QR
 		Level:         level,
 		VersionNumber: chosenVersion.version,
 
-		ForegroundColor: color.Black,
 		BackgroundColor: color.White,
+		PixelColor:      color.Black,
+		BoxColor:        color.Black,
 
 		encoder: encoder,
 		data:    encoded,
@@ -255,6 +272,25 @@ func NewWithForcedVersion(content string, version int, level RecoveryLevel) (*QR
 	}
 
 	return q, nil
+}
+
+// NewWithMinimumVersion constructs a QRCode with a minimum version. This should be used when generating custom QRCode for higher error recovery.
+//
+// var q *qrcode.QRCode
+// q, err := qrcode.NewWithMinimumVersion("my content", 6, grcode.Highest)
+//
+// An error occurs if the content is too long.
+func NewWithMinimumVersion(content string, minVersion int, level RecoveryLevel) (*QRCode, error) {
+	code, err := New(content, level)
+	if err != nil {
+		return nil, err
+	}
+
+	if code.VersionNumber >= minVersion {
+		return code, nil
+	}
+
+	return NewWithForcedVersion(content, minVersion, level)
 }
 
 // Bitmap returns the QR Code as a 2D array of 1-bit pixels.
@@ -305,15 +341,17 @@ func (q *QRCode) Image(size int) image.Image {
 	rect := image.Rectangle{Min: image.Point{0, 0}, Max: image.Point{size, size}}
 
 	// Saves a few bytes to have them in this order
-	p := color.Palette([]color.Color{q.BackgroundColor, q.ForegroundColor})
+	p := color.Palette([]color.Color{q.BackgroundColor, q.BoxColor, q.PixelColor})
 	img := image.NewPaletted(rect, p)
-	fgClr := uint8(img.Palette.Index(q.ForegroundColor))
+
+	// Map each image pixel to the nearest QR code module.
+	modulesPerPixel := float64(realSize) / float64(size)
 
 	// QR code bitmap.
 	bitmap := q.symbol.bitmap()
 
-	// Map each image pixel to the nearest QR code module.
-	modulesPerPixel := float64(realSize) / float64(size)
+	// color pixels
+	fgClr := uint8(img.Palette.Index(q.PixelColor))
 	for y := 0; y < size; y++ {
 		y2 := int(float64(y) * modulesPerPixel)
 		for x := 0; x < size; x++ {
@@ -328,7 +366,416 @@ func (q *QRCode) Image(size int) image.Image {
 		}
 	}
 
+	// QR code boxes map.
+	boxes := q.symbol.finderPatternBitmap()
+
+	// color boxes
+	fgClr = uint8(img.Palette.Index(q.BoxColor))
+	for y := 0; y < size; y++ {
+		y2 := int(float64(y) * modulesPerPixel)
+		for x := 0; x < size; x++ {
+			x2 := int(float64(x) * modulesPerPixel)
+
+			v := boxes[y2][x2]
+
+			if v {
+				pos := img.PixOffset(x, y)
+				img.Pix[pos] = fgClr
+			}
+		}
+	}
+
 	return img
+}
+
+// BeautifyImage returns the QR Code as an image.Image.
+//
+// A positive size sets a fixed image width and height (e.g. 256 yields an
+// 256x256px image).
+//
+// Depending on the amount of data encoded, fixed size images can have different
+// amounts of padding (white space around the QR Code). As an alternative, a
+// variable sized image can be generated instead:
+//
+// A negative size causes a variable sized image to be returned. The image
+// returned is the minimum size required for the QR Code. Choose a larger
+// negative number to increase the scale of the image. e.g. a size of -5 causes
+// each module (QR Code "pixel") to be 5px in size.
+func (q *QRCode) BeautifyImage(size int) image.Image {
+	// Build QR code.
+	q.encode()
+
+	// Minimum pixels (both width and height) required.
+	realSize := q.symbol.size
+
+	// Variable size support.
+	if size < 0 {
+		size = size * -1 * realSize
+	}
+
+	// Actual pixels available to draw the symbol. Automatically increase the
+	// image size if it's not large enough.
+	if size < realSize {
+		size = realSize
+	}
+
+	// Output image.
+	rect := image.Rectangle{Min: image.Point{0, 0}, Max: image.Point{size, size}}
+
+	// Saves a few bytes to have them in this order
+	img := image.NewRGBA(rect)
+
+	// set everything to background color
+	for x := 0; x < img.Bounds().Max.X; x++ {
+		for y := 0; y < img.Bounds().Max.Y; y++ {
+			img.Set(x, y, q.BackgroundColor)
+
+		}
+	}
+
+	// Map each image pixel to the nearest QR code module.
+	modulesPerPixel := float64(realSize) / float64(size)
+	sizePerPoint := int(float64(size) / float64(realSize))
+
+	// undrawables
+	finderPatternMap := make(map[string]struct{})
+	alignmentPatternMap := make(map[string]struct{})
+	logoMap := make(map[string]struct{})
+
+	// QR code finder pattern bitmap.
+	bitmap := q.symbol.finderPatternBitmap()
+	for y := 0; y < size; y++ {
+		y2 := int(float64(y) * modulesPerPixel)
+		for x := 0; x < size; x++ {
+			x2 := int(float64(x) * modulesPerPixel)
+
+			v := bitmap[y2][x2]
+
+			if v {
+				pixel := fmt.Sprintf("%d,%d", y2, x2)
+				finderPatternMap[pixel] = struct{}{}
+			}
+		}
+	}
+
+	if q.FinderPatternImage != nil {
+		if q.finderPatternImageCache == nil {
+			q.finderPatternImageCache = make(map[int]image.Image)
+		}
+
+		box := *q.FinderPatternImage
+		boxSize := int(float64(q.symbol.finderPatternSize) / modulesPerPixel)
+		var boxFit image.Image
+		if fittedBox, found := q.finderPatternImageCache[boxSize]; found {
+			boxFit = fittedBox
+		} else {
+			boxFitted := imaging.Fit(box, boxSize, boxSize, imaging.Lanczos)
+			boxBackground := rectangleImage(boxSize, boxSize, q.BackgroundColor)
+			boxFit = overlayImages(boxBackground, boxFitted, image.Point{})
+			q.finderPatternImageCache[boxSize] = boxFit
+		}
+
+		borderSize := q.symbol.borderSize()
+		TLMin, TRMin, BLMin := q.symbol.finderPatternPoints()
+
+		TLMin.X = int(float64(TLMin.X+borderSize) / modulesPerPixel)
+		TLMin.Y = int(float64(TLMin.Y+borderSize) / modulesPerPixel)
+
+		TRMin.X = int(float64(TRMin.X+borderSize) / modulesPerPixel)
+		TRMin.Y = int(float64(TRMin.Y+borderSize) / modulesPerPixel)
+
+		BLMin.X = int(float64(BLMin.X+borderSize) / modulesPerPixel)
+		BLMin.Y = int(float64(BLMin.Y+borderSize) / modulesPerPixel)
+
+		TLMax := TLMin.Add(image.Point{boxSize, boxSize})
+		TRMax := TRMin.Add(image.Point{boxSize, boxSize})
+		BLMax := BLMin.Add(image.Point{boxSize, boxSize})
+
+		for x := TLMin.X; x < TLMax.X; x++ {
+			for y := TLMin.Y; y < TLMax.Y; y++ {
+				img.Set(x, y, boxFit.At(x-TLMin.X, y-TLMin.Y))
+			}
+		}
+
+		for x := TRMin.X; x < TRMax.X; x++ {
+			for y := TRMin.Y; y < TRMax.Y; y++ {
+				img.Set(x, y, boxFit.At(x-TRMin.X, y-TRMin.Y))
+			}
+		}
+
+		for x := BLMin.X; x < BLMax.X; x++ {
+			for y := BLMin.Y; y < BLMax.Y; y++ {
+				img.Set(x, y, boxFit.At(x-BLMin.X, y-BLMin.Y))
+			}
+		}
+
+	} else {
+
+		for x := 0; x < realSize; x++ {
+			for y := 0; y < realSize; y++ {
+				if bitmap[y][x] {
+
+					// find the box of pixels to light up
+					minX, minY := int(math.Round(float64(x)/modulesPerPixel)), int(math.Round(float64(y)/modulesPerPixel))
+					maxX, maxY := minX+sizePerPoint, minY+sizePerPoint
+
+					for xp := minX; xp < maxX; xp++ {
+						for yp := minY; yp < maxY; yp++ {
+							img.Set(xp, yp, q.BoxColor)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// QR code last alignment pattern bitmap.
+	bitmap = q.symbol.lastAlignmentPatternBitmap()
+	for y := 0; y < size; y++ {
+		y2 := int(float64(y) * modulesPerPixel)
+		for x := 0; x < size; x++ {
+			x2 := int(float64(x) * modulesPerPixel)
+
+			v := bitmap[y2][x2]
+
+			if v {
+				pixel := fmt.Sprintf("%d,%d", y2, x2)
+				alignmentPatternMap[pixel] = struct{}{}
+			}
+		}
+	}
+
+	if q.AlignmentPatternImage != nil {
+		if q.alignmentPatternImageCache == nil {
+			q.alignmentPatternImageCache = make(map[int]image.Image)
+		}
+
+		box := *q.AlignmentPatternImage
+		boxSize := int(float64(q.symbol.alignmentPatternSize) / modulesPerPixel)
+		var boxFit image.Image
+		if fittedBox, found := q.alignmentPatternImageCache[boxSize]; found {
+			boxFit = fittedBox
+		} else {
+			boxFitted := imaging.Fit(box, boxSize, boxSize, imaging.Lanczos)
+			boxBackground := rectangleImage(boxSize, boxSize, q.BackgroundColor)
+			boxFit = overlayImages(boxBackground, boxFitted, image.Point{})
+			q.alignmentPatternImageCache[boxSize] = boxFit
+		}
+
+		borderSize := q.symbol.borderSize()
+		minPt := q.symbol.alignmentPatternPoint
+
+		minPt.X = int(float64(minPt.X+borderSize) / modulesPerPixel)
+		minPt.Y = int(float64(minPt.Y+borderSize) / modulesPerPixel)
+
+		maxPt := minPt.Add(image.Point{boxSize, boxSize})
+
+		for x := minPt.X; x < maxPt.X; x++ {
+			for y := minPt.Y; y < maxPt.Y; y++ {
+				img.Set(x, y, boxFit.At(x-minPt.X, y-minPt.Y))
+			}
+		}
+
+	} else {
+
+		for x := 0; x < realSize; x++ {
+			for y := 0; y < realSize; y++ {
+				if bitmap[y][x] {
+
+					// find the box of pixels to light up
+					minX, minY := int(math.Round(float64(x)/modulesPerPixel)), int(math.Round(float64(y)/modulesPerPixel))
+					maxX, maxY := minX+sizePerPoint, minY+sizePerPoint
+
+					for xp := minX; xp < maxX; xp++ {
+						for yp := minY; yp < maxY; yp++ {
+							img.Set(xp, yp, q.PixelColor)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if q.CenterLogo != nil {
+		if q.centerLogoCache == nil {
+			q.centerLogoCache = make(map[int]image.Image)
+		}
+
+		logo := *q.CenterLogo
+		maxLogoSize := int(float64(size) * 0.35)
+		logoSize := logo.Bounds().Max.X
+		if logo.Bounds().Max.Y > logoSize {
+			logoSize = logo.Bounds().Max.Y
+		}
+		if logoSize > maxLogoSize {
+			logoSize = maxLogoSize
+		}
+		if logoSize%2 != 0 {
+			logoSize -= 1
+		}
+
+		var logoFit image.Image
+
+		if fittedLogo, found := q.centerLogoCache[logoSize]; found {
+			logoFit = fittedLogo
+		} else {
+			logoFitted := imaging.Fit(logo, logoSize, logoSize, imaging.Lanczos)
+			logoBackground := circleImage(logoSize/2+q.centerLogoBackgroundOffset, q.BackgroundColor)
+			logoFit = overlayImages(logoBackground, logoFitted, image.Point{-q.centerLogoBackgroundOffset, -q.centerLogoBackgroundOffset})
+			q.centerLogoCache[logoSize] = logoFit
+		}
+
+		minX := (size - logoFit.Bounds().Max.X) / 2
+		minY := (size - logoFit.Bounds().Max.Y) / 2
+		maxX := minX + logoFit.Bounds().Max.X
+		maxY := minY + logoFit.Bounds().Max.Y
+
+		for x := minX; x < maxX; x++ {
+			for y := minY; y < maxY; y++ {
+				r, g, b, a := logoFit.At(x-minX, y-minY).RGBA()
+				rI, gI, bI, aI := img.At(x, y).RGBA()
+				newCol := color.NRGBA{
+					R: uint8(r + rI),
+					G: uint8(g + gI),
+					B: uint8(b + bI),
+					A: uint8(a + aI),
+				}
+
+				if a == 65535 {
+					y2 := int(float64(y) * modulesPerPixel)
+					x2 := int(float64(x) * modulesPerPixel)
+					pixel := fmt.Sprintf("%d,%d", y2, x2)
+					logoMap[pixel] = struct{}{}
+					img.Set(x, y, newCol)
+				}
+			}
+		}
+
+	}
+
+	// QR code bitmap.
+	bitmap = q.symbol.bitmap()
+	for x := 0; x < realSize; x++ {
+		for y := 0; y < realSize; y++ {
+			if bitmap[y][x] {
+				pixel := fmt.Sprintf("%d,%d", y, x)
+				if _, found := finderPatternMap[pixel]; !found {
+					if _, found = alignmentPatternMap[pixel]; !found {
+						if _, found = logoMap[pixel]; !found {
+
+							// find the box of pixels to light up
+							minX, minY := int(math.Round(float64(x)/modulesPerPixel)), int(math.Round(float64(y)/modulesPerPixel))
+							maxX, maxY := minX+sizePerPoint, minY+sizePerPoint
+
+							for xp := minX; xp < maxX; xp++ {
+								for yp := minY; yp < maxY; yp++ {
+									img.Set(xp, yp, q.PixelColor)
+								}
+							}
+
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return img
+}
+
+func (q *QRCode) LoadAndSetCenterLogo(path string, offset int) error {
+	img, err := loadImage(path)
+	if err == nil {
+		q.CenterLogo = img
+		q.centerLogoBackgroundOffset = offset
+	}
+	return err
+}
+
+func (q *QRCode) LoadAndSetFinderPatternImage(path string) error {
+	img, err := loadImage(path)
+	if err == nil {
+		q.FinderPatternImage = img
+	}
+	return err
+}
+
+func (q *QRCode) LoadAndSetAlignmentPatternImage(path string) error {
+	img, err := loadImage(path)
+	if err == nil {
+		q.AlignmentPatternImage = img
+	}
+	return err
+}
+
+func loadImage(path string) (*image.Image, error) {
+	file, openErr := os.Open(path)
+	if openErr != nil {
+		return nil, openErr
+	}
+
+	logo, _, decodeErr := image.Decode(file)
+	if decodeErr != nil {
+		return nil, decodeErr
+	}
+
+	return &logo, nil
+}
+
+func overlayImages(base, overlay image.Image, offset image.Point) image.Image {
+	img := image.NewRGBA(image.Rect(0, 0, base.Bounds().Max.X, base.Bounds().Max.Y))
+
+	draw.Draw(img, img.Bounds(), base, image.Point{}, draw.Src)
+	draw.Draw(img, overlay.Bounds(), overlay, offset, draw.Over)
+
+	return img
+}
+
+type circleStruct struct {
+	p image.Point
+	r int
+	c color.Color
+}
+
+func (c *circleStruct) ColorModel() color.Model {
+	return color.RGBAModel
+}
+
+func (c *circleStruct) Bounds() image.Rectangle {
+	return image.Rect(c.p.X-int(c.r), c.p.Y-int(c.r), c.p.X+int(c.r), c.p.Y+int(c.r))
+}
+
+func (c *circleStruct) At(x, y int) color.Color {
+	xx, yy, rr := float64(x-c.p.X)+0.5, float64(y-c.p.Y)+0.5, float64(c.r)
+	if xx*xx+yy*yy < rr*rr {
+		return c.c
+	}
+	return color.Alpha{0}
+}
+
+func circleImage(radius int, c color.Color) image.Image {
+	return &circleStruct{p: image.Point{radius, radius}, r: radius, c: c}
+}
+
+type rectangleStruct struct {
+	size image.Point
+	c    color.Color
+}
+
+func (r *rectangleStruct) ColorModel() color.Model {
+	return color.RGBAModel
+}
+
+func (r *rectangleStruct) Bounds() image.Rectangle {
+	return image.Rect(0, 0, r.size.X, r.size.Y)
+}
+
+func (r *rectangleStruct) At(x, y int) color.Color {
+	return r.c
+}
+
+func rectangleImage(width, height int, c color.Color) image.Image {
+	return &rectangleStruct{size: image.Point{width, height}, c: c}
 }
 
 // PNG returns the QR Code as a PNG image.
@@ -417,7 +864,7 @@ func (q *QRCode) encode() {
 
 		p := s.penaltyScore()
 
-		//log.Printf("mask=%d p=%3d p1=%3d p2=%3d p3=%3d p4=%d\n", mask, p, s.penalty1(), s.penalty2(), s.penalty3(), s.penalty4())
+		// log.Printf("mask=%d p=%3d p1=%3d p2=%3d p3=%3d p4=%d\n", mask, p, s.penalty1(), s.penalty2(), s.penalty3(), s.penalty4())
 
 		if q.symbol == nil || p < penalty {
 			q.symbol = s

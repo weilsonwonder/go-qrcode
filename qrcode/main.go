@@ -64,7 +64,7 @@ Usage:
 	}
 
 	if *negative {
-		q.ForegroundColor, q.BackgroundColor = q.BackgroundColor, q.ForegroundColor
+		q.PixelColor, q.BackgroundColor = q.BackgroundColor, q.PixelColor
 	}
 
 	var png []byte
